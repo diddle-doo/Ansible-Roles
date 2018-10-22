@@ -1,0 +1,5 @@
+---
+tableau_server_version: '10-5-0'
+vertica_client_version: '9.1.1-0'
+sql_server_version: '1.00.40'
+redshift_version: '1.4.2.1010-1' 

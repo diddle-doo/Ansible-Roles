@@ -1,0 +1,380 @@
+---
+- name: Install updates
+  command: apt-get update -y
+
+- name: Install gdebi-core
+  apt:
+    name: "{{ item }}"
+    state: present
+  with_items:
+    - gdebi-core
+    - python-pip
+
+- name: Install boto3 for getting aws credentials
+  pip:
+   name: boto3
+ 
+- name: Check if the file exists
+  stat:
+    path: /opt/tableau-server-{{ tableau_server_version }}_amd64.deb
+  register: download
+
+- name: Download tableau server package
+  aws_s3:
+    aws_access_key: "{{ lookup('env','aws_access_key_id') }}" 
+    aws_secret_key: "{{ lookup('env','aws_secret_access_key') }}" 
+    bucket: tnbi-dist-us-east-1
+    object: tableau-server-{{ tableau_server_version }}_amd64.deb
+    dest: /opt/tableau-server-{{ tableau_server_version }}_amd64.deb
+    mode: get
+#  get_url:
+#    url: https://downloads.tableau.com/esdalt/10.5.0/tableau-server-{{ tableau_server_version }}_amd64.deb
+#    dest: /opt
+#  when: download.stat.exists == False
+
+- name: Check if tableau server is installed
+  stat:
+    path: /opt/tableau/
+  register: install
+
+- name: Get the sha256sum of the script
+  stat:
+     path: /opt/tableau-server-{{ tableau_server_version }}_amd64.deb
+     checksum_algorithm: sha256
+     get_checksum: yes
+  register: sha_value
+
+- name: Verify sha256sum of script before execution
+  debug:
+    msg: "Failure, file is not correct."
+  when: sha_value.stat.checksum != "c7b8bb34bea03ef09a40ab5c0342f43d2e16b00e"
+
+- name: Install tableau server
+  command: gdebi -n /opt/tableau-server-{{ tableau_server_version }}_amd64.deb
+  when: install.stat.exists == False
+
+- name: Configure licensing daemon port 
+  replace:
+      path: "{{ item.dest }}"
+      regexp: '^VENDOR tableau'
+      replace: 'VENDOR tableau port=27010'
+      backup: yes
+  with_items:
+    - {dest: '/opt/tableau/tableau_server/packages/templates.10500.18.0109.1050/license/tableau.lic.templ' }
+    - {dest: '/opt/tableau/tableau_server/packages/bin.10500.18.0109.1050/tableau.lic' } 
+
+- name: Change directory and execute command only on master node
+  command: chdir=/opt/tableau/tableau_server/packages/scripts.10500.18.0109.1050 ./initialize-tsm --accepteula
+  when: inventory_hostname == "replace_master_ip-address"
+
+## https://stackoverflow.com/questions/29955605/how-to-reboot-centos-7-with-ansible
+- name: restart server only master node
+  shell: sleep 2 && shutdown -r now "Ansible updates triggered"
+  async: 1
+  poll: 0
+  become: true
+  ignore_errors: true
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: waiting for the server to come back
+  local_action: wait_for host="replace_master_ip-address" state=started delay=2 timeout=200
+  sudo: false
+
+- name: Configure licensing daemon port
+  replace:
+      path: "{{ item.dest }}"
+      regexp: '^VENDOR tableau'
+      replace: 'VENDOR tableau port=27010'
+      backup: yes
+  with_items:
+    - {dest: '/var/opt/tableau/tableau_server/data/tabsvc/config/tabadmincontroller_0.10500.18.0109.1050/tableau.lic' }
+  when: inventory_hostname == "replace_master_ip-address"
+
+# https://v-punk.com/automate-password-changes-with-ansible/
+- name: Change Password on master node
+  user:
+      name: ubuntu
+      password: "$6$rounds=656000$1WJ0n0pwxIxCoqPn$s7yckmGnk3SPZn.zX8r7W67V6gSvj4OAVyMBwj6QjFlHi42UihqNR15/QN2CS8jNJvNsP3dNTA0X2k6EKylqR1"
+      update_password: always
+  become: yes
+  when: inventory_hostname == "replace_master_ip-address"
+
+
+- name: Login to Tableau manager
+  shell: source /etc/profile.d/tableau_server.sh && tsm login -u ubuntu -p {{ tableau_server_admin_password }}
+  args:
+     executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Activate Tableau Server
+  shell: source /etc/profile.d/tableau_server.sh && tsm licenses activate -t
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+ 
+- name: Generate a template
+  shell: source /etc/profile.d/tableau_server.sh && tsm register --template > /home/ubuntu/registration_file.json
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Edit the template file
+  template:
+    src: registration_file.json
+    dest: /home/ubuntu/registration_file.json
+    owner: ubuntu
+    group: ubuntu
+    mode: 0664
+  when: inventory_hostname == "replace_master_ip-address"
+
+
+- name: Register tableau server
+  shell: source /etc/profile.d/tableau_server.sh && tsm register --file /home/ubuntu/registration_file.json
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Create config file
+  command: touch /home/ubuntu/config.json
+  args:
+    creates: /home/ubuntu/config.json
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Edit the template file
+  template:
+    src: config.json
+    dest: /home/ubuntu/config.json
+    owner: ubuntu
+    group: ubuntu
+    mode: 0664
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Configure identity store settings
+  shell: source /etc/profile.d/tableau_server.sh && tsm settings import -f /home/ubuntu/config.json
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Apply pending configuration changes
+  shell: source /etc/profile.d/tableau_server.sh && tsm pending-changes apply -r -u ubuntu -p '{{ tableau_server_admin_password }}'
+  args:
+     executable: "/bin/bash"
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Initialize and Start Tableau Server
+  shell: source /etc/profile.d/tableau_server.sh && tsm initialize -u ubuntu -p '{{ tableau_server_admin_password }}' --start-server --request-timeout 1800
+  args:
+    executable: /bin/bash   
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Create the initial admin user
+  command: chdir=/opt/tableau/tableau_server/packages/bin.10500.18.0109.1050 ./tabcmd initialuser --server 'localhost:80' --username 'admin' --password '{{ tableau_server_admin_password }}'
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Generate the node bootstrap file
+  shell: source /etc/profile.d/tableau_server.sh && tsm topology nodes get-bootstrap-file --file /home/ubuntu/bootstrap.json
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Copy the bootstrap.json from master to local
+  fetch:
+    src: /home/ubuntu/bootstrap.json
+    dest: /home/ubuntu/bootstrap.json
+  when: inventory_hostname == "replace_master_ip-address"
+
+# replace master ip-address in src
+- name: copy the file to worker node
+  copy:
+     src: /home/ubuntu/bootstrap.json/replace_master_ip-address/home/ubuntu
+     dest: /home/ubuntu/bootstrap.json
+  when: inventory_hostname == "replace_worker_ip_address"
+
+
+- name: Initiate communication between the initial node and the new worker  node
+  command: chdir=/opt/tableau/tableau_server/packages/scripts.10500.18.0109.1050 ./initialize-tsm -b /home/ubuntu/bootstrap.json/ubuntu/bootstrap.json -u ubuntu -p {{ tableau_server_admin_password }} --accepteula
+  when: inventory_hostname == "replace_worker_ip_address"
+
+- name: restart server only worker node
+  shell: sleep 2 && shutdown -r now "Ansible updates triggered"
+  async: 1
+  poll: 0
+  become: true
+  ignore_errors: true
+  when: inventory_hostname == "replace_worker_ip_address"
+
+- name: waiting for the server to come back
+  local_action: wait_for host="replace_worker_ip_address" state=started delay=10 timeout=300
+  sudo: false
+
+- name: Add processes for worker node
+  shell: source /etc/profile.d/tableau_server.sh && tsm status -v -u ubuntu -p {{ tableau_server_admin_password }}
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+# with items not working - giving /bin/bash: tsm topology set-process -n node2 -pr clustercontroller -c 1: command not found  
+- name: Add processes for worker node
+  shell: source /etc/profile.d/tableau_server.sh && tsm topology set-process -n node2 -pr clustercontroller -c 1
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Add processes for worker node
+  shell: source /etc/profile.d/tableau_server.sh && tsm topology set-process -n node2 -pr gateway -c 1
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Apply pending changes
+  shell: source /etc/profile.d/tableau_server.sh && tsm pending-changes apply -r -u ubuntu -p '{{ tableau_server_admin_password }}'
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Activate the tableau server with prod license key 
+  shell: source /etc/profile.d/tableau_server.sh && tsm licenses activate -k {{ tableau_server_key }}
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Stop the tableau server
+  shell: source /etc/profile.d/tableau_server.sh && tsm stop
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Add the backgrounder process
+  shell: source /etc/profile.d/tableau_server.sh && tsm topology set-process -n node2 -pr backgrounder -c 2  
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Apply pending changes
+  shell: source /etc/profile.d/tableau_server.sh && tsm pending-changes apply -r -u ubuntu -p '{{ tableau_server_admin_password }}'
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Apply pending changes
+  shell: source /etc/profile.d/tableau_server.sh && tsm start
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+# Setting workgroup postgresql
+
+- name: Configure postgres workgroup
+  shell: source /etc/profile.d/tableau_server.sh && tsm configuration set -k pgsql.preferred_host -v "replace-ip-address-of-master"
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+- name: Enable data-access to workgroup and supress prompt
+  shell: source /etc/profile.d/tableau_server.sh && tsm data-access repository-access enable -r --repository-username '{{ tableau-repository-user-name }}'  --repository-password '{{ tableau-repository-password }}'
+   args:
+    executable: /bin/bash
+  when: inventory_hostname == "replace_master_ip-address"
+
+
+- name: Download redshift driver
+  get_url:
+     url: https://s3.amazonaws.com/redshift-downloads/drivers/odbc/1.4.2.1010/AmazonRedshiftODBC-64-bit-{{ redshift_version }}.x86_64.deb
+     dest: /opt
+
+- name: Get the sha256sum of the script
+  stat:
+     path: /opt/AmazonRedshiftODBC-64-bit-{{ redshift_version }}.x86_64.deb
+     checksum_algorithm: sha256
+     get_checksum: yes
+  register: sha_redshift_value
+
+
+- name: Verify sha256sum of script before execution
+  debug:
+    msg: "Failure, file is not correct."
+  when: sha_redshift_value.stat.checksum != "edf79d709d4b2a5e501bb57405e6cc9ec196d5dd005252d6f72122bbbc9cd66a"
+
+- name: Install redshift driver
+  command: sudo gdebi --non-interactive /opt/AmazonRedshiftODBC-64-bit-{{ redshift_version }}.x86_64.deb
+
+- name: Append all distros 
+  template:
+    src: odbcinst.ini
+    dest: /etc/odbcinst.ini
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Replace values for redshift configuration
+  replace:
+      path: "/opt/amazon/redshiftodbc/lib/64/amazon.redshiftodbc.ini"
+      regexp: "{{ item.regexp }}"
+      replace: "{{ item.replace }}"
+      backup: yes
+  with_items:
+    - {regexp: '^DriverManagerEncoding=UTF-32',replace: 'DriverManagerEncoding=UTF-16' }
+    - {regexp: '^LogPath=[LogPath]',replace: 'LogPath=/tmp' }
+
+
+- name: Update redshift config
+  lineinfile:
+    dest: /opt/amazon/redshiftodbc/lib/64/amazon.redshiftodbc.ini"
+    line: "ODBCInstLib=libiodbcinst.so"
+    regexp: '^LogPath=/tmp'
+    state: present
+    insertafter: EOF
+    create: True
+
+
+- name: Download sqlserver driver
+  get_url: 
+     url: https://downloads.tableau.com/drivers/linux/deb/tableau-driver/tableau-freetds_{{ sql_server_version }}_amd64.deb
+     dest: /opt
+
+- name: Get the sha256sum of the script
+  stat:
+     path: /opt/tableau-freetds_{{ sql_server_version }}_amd64.deb
+     checksum_algorithm: sha256
+     get_checksum: yes
+  register: sha_sqlserver_value
+
+
+- name: Verify sha256sum of script before execution
+  debug:
+    msg: "Failure, file is not correct."
+  when: sha_sqlserver_value.stat.checksum != "293711bd8bbf50d03832b11ad8c3528b8c1b2157c9bf4e71d2e3c06017ecec79"
+
+- name: Install sqlserver driver
+  command: gdebi /opt/tableau-freetds_{{ sql_server_version }}_amd64.deb     
+
+
+- name: Download vertica driver 
+  get_url:
+    url: https://my.vertica.com/client_drivers/9.1.x/9.1.1-0/vertica-client-{{ vertica_client_version }}.x86_64.tar.gz
+    dest: /opt/
+
+- name: Get the sha256sum of the script
+  stat:
+     path: /opt/vertica-client-{{ vertica_client_version }}.x86_64.tar.gz
+     checksum_algorithm: sha256
+     get_checksum: yes
+  register: sha_vertica_value
+
+
+- name: Verify sha256sum of script before execution
+  debug:
+    msg: "Failure, file is not correct."
+  when: sha_vertica_value.stat.checksum != "ccea61b0708cd7c2c9afec65f77eb6ea4b2b99796b9472e9e755cc25c3fef349"
+
+- name: Install vertica driver
+  command: tar -C / -xzvf /opt/vertica-client-{{ vertica_client_version }}.x86_64.tar.gz
+
+- name: Add vertica config
+  blockinfile:
+    path: /etc/odbcinst.ini
+    block: |
+          [Vertica]
+          Driver=/opt/vertica/lib64/libverticaodbc.so
+    insertafter: "^Driver=/opt/amazon/redshiftodbc/lib/64/libamazonredshiftodbc64.so"
+    state: present
